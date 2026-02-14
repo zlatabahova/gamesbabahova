@@ -3,43 +3,13 @@ import logging
 import requests
 import os
 import sys
-import fcntl
-import atexit
 import pickle
 import traceback
+import time
+from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, filters, ContextTypes
 import config
-
-# --- Защита от запуска нескольких экземпляров ---
-LOCKFILE = "/tmp/bot_single_instance.lock"
-
-def single_instance():
-    """Пытаемся получить эксклюзивную блокировку файла.
-    Если не получается — значит другой экземпляр уже работает."""
-    try:
-        lock_file = open(LOCKFILE, 'w')
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        lock_file.write(str(os.getpid()))
-        lock_file.flush()
-        atexit.register(lambda: fcntl.flock(lock_file, fcntl.LOCK_UN))
-        return lock_file
-    except (IOError, OSError):
-        print("❌ Ошибка: другой экземпляр бота уже запущен. Завершаем работу.")
-        sys.exit(1)
-
-# --- Функция сброса вебхука (чтобы избежать конфликтов) ---
-def drop_pending_updates(token):
-    """Сообщаем Telegram, что мы готовы принимать обновления, и сбрасываем вебхук."""
-    url = f"https://api.telegram.org/bot{token}/deleteWebhook?drop_pending_updates=true"
-    try:
-        response = requests.get(url)
-        if response.status_code == 200:
-            print("✅ Вебхук сброшен, старые апдейты удалены")
-        else:
-            print(f"⚠️ Ошибка сброса вебхука: {response.text}")
-    except Exception as e:
-        print(f"⚠️ Не удалось сбросить вебхук: {e}")
 
 # --- Настройка логирования ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -47,10 +17,9 @@ logger = logging.getLogger(__name__)
 
 # --- Константы ---
 NAME, GAME, TIME = range(3)
-WEBHOOK_URL = "https://hook.eu1.make.com/p6xhpykdytosqseygbrp3zw6c7bgvypp"   # твой вебхук Make.com
-ADMIN_CHAT_ID = 518113103                                                     # твой Telegram ID
+ADMIN_CHAT_ID = 518113103          # ваш Telegram ID
 
-# --- Работа с файлом пользователей ---
+# --- Работа с файлом пользователей (для рассылки) ---
 USERS_FILE = "users.pkl"
 
 def load_users():
@@ -64,6 +33,44 @@ def save_user(user_id):
     users.add(user_id)
     with open(USERS_FILE, 'wb') as f:
         pickle.dump(users, f)
+
+# --- Flask для приёма вебхуков от Telegram ---
+flask_app = Flask(__name__)
+
+# --- Telegram Application (будет инициализирован позже) ---
+application = None
+
+# --- Функция установки вебхука ---
+def set_webhook():
+    # Render автоматически задаёт переменную окружения RENDER_EXTERNAL_HOSTNAME
+    hostname = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
+    if not hostname:
+        logger.error("❌ RENDER_EXTERNAL_HOSTNAME не задан. Вебхук не установлен.")
+        return
+    webhook_url = f"https://{hostname}/{config.BOT_TOKEN}"
+    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/setWebhook?url={webhook_url}"
+    try:
+        r = requests.get(url)
+        if r.status_code == 200:
+            logger.info(f"✅ Вебхук установлен на {webhook_url}")
+        else:
+            logger.error(f"❌ Ошибка установки вебхука: {r.text}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при запросе к Telegram: {e}")
+
+# --- Маршрут для вебхуков ---
+@flask_app.route(f'/{config.BOT_TOKEN}', methods=['POST'])
+def webhook():
+    if application is None:
+        return "Application not ready", 503
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put(update)
+    return "OK", 200
+
+# --- Маршрут для проверки здоровья (Render иногда проверяет) ---
+@flask_app.route('/health', methods=['GET'])
+def health():
+    return "OK", 200
 
 # --- ОСНОВНЫЕ ОБРАБОТЧИКИ ДИАЛОГА ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -110,7 +117,7 @@ async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     result_message = f"✅ Ты записан!\n\nИмя: {player_name}\nИгра: {game}\nВремя: {time}\n\nЖдем тебя в Дискорде!"
     await query.edit_message_text(result_message)
 
-    # Уведомление админу
+    # Уведомление админу (вам) — теперь только сюда, без Make.com
     admin_message = (
         f"📝 Новая запись!\n\n"
         f"Имя: {player_name}\n"
@@ -124,19 +131,7 @@ async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение админу: {e}")
 
-    # Отправка в Google Sheets через Make.com
-    data = {
-        "name": player_name,
-        "game": game,
-        "time": time,
-        "username": username,
-        "user_id": user_id
-    }
-    try:
-        requests.post(WEBHOOK_URL, json=data)
-        logger.info("Данные отправлены в Make.com")
-    except Exception as e:
-        logger.error(f"Ошибка отправки в Make: {e}")
+    # ВАЖНО: отправка в Make.com УДАЛЕНА
 
     return ConversationHandler.END
 
@@ -147,12 +142,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Просто нажми /start, чтобы записаться на игру.")
 
-# --- КОМАНДА ДЛЯ ПРОВЕРКИ (PING) ---
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ответит 'pong' — для проверки, что бот работает."""
     await update.message.reply_text("pong 🏓")
 
-# --- КОМАНДА РАССЫЛКИ (ТОЛЬКО ДЛЯ АДМИНА) ---
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_CHAT_ID:
@@ -196,10 +188,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=f"📊 Отчёт о рассылке:\nУспешно: {success}, Ошибок: {failed}"
     )
 
-# --- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ---
+# --- Глобальный обработчик ошибок ---
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    # Формируем текст ошибки для отправки админу
     tb = traceback.format_exception(None, context.error, context.error.__traceback__)
     tb_string = ''.join(tb)
     try:
@@ -211,15 +202,10 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-# --- ЗАПУСК БОТА ---
-def main() -> None:
-    # Проверка единственного экземпляра
-    single_instance()
-
-    # Сброс вебхука перед запуском
-    drop_pending_updates(config.BOT_TOKEN)
-
-    # Создаём приложение
+# --- Функция инициализации и запуска бота ---
+def run_bot():
+    global application
+    # Создаём Application
     application = Application.builder().token(config.BOT_TOKEN).build()
 
     # Диалог записи
@@ -233,17 +219,30 @@ def main() -> None:
         fallbacks=[CommandHandler('cancel', cancel)],
     )
 
-    # Добавляем обработчики
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("ping", ping))
     application.add_handler(CommandHandler("broadcast", broadcast))
-
-    # Глобальный обработчик ошибок
     application.add_error_handler(error_handler)
 
-    print("Бот запущен...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Устанавливаем вебхук
+    set_webhook()
 
-if __name__ == '__main__':
-    main()
+    # Запускаем обработку обновлений (вебхуки будут приходить на Flask)
+    # В этом режиме application.run_webhook() не используется, мы сами принимаем через Flask
+    # Но нужно запустить процесс обработки очереди. Для этого используем application.start()
+    application.initialize()
+    application.start()
+    logger.info("✅ Бот запущен и готов принимать вебхуки")
+
+# --- Точка входа для Flask ---
+@flask_app.before_first_request
+def before_first_request():
+    # Инициализируем бота при первом запросе
+    run_bot()
+
+# --- Запуск Flask-сервера ---
+if __name__ == "__main__":
+    # Запускаем Flask (Render сам задаст порт через переменную окружения PORT)
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
