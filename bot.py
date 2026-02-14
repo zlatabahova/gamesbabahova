@@ -5,6 +5,8 @@ import os
 import sys
 import fcntl
 import atexit
+import pickle
+import traceback
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, filters, ContextTypes
 import config
@@ -16,57 +18,54 @@ def single_instance():
     """Пытаемся получить эксклюзивную блокировку файла.
     Если не получается — значит другой экземпляр уже работает."""
     try:
-        # Открываем файл для блокировки
         lock_file = open(LOCKFILE, 'w')
-        # Пытаемся захватить блокировку (неблокирующий режим)
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        # Записываем PID процесса в файл
         lock_file.write(str(os.getpid()))
         lock_file.flush()
-        # При выходе из программы автоматически снимем блокировку
         atexit.register(lambda: fcntl.flock(lock_file, fcntl.LOCK_UN))
         return lock_file
     except (IOError, OSError):
-        # Не удалось получить блокировку
         print("❌ Ошибка: другой экземпляр бота уже запущен. Завершаем работу.")
         sys.exit(1)
-# ------------------------------------------------
 
-# Включаем логирование
+# --- Функция сброса вебхука (чтобы избежать конфликтов) ---
+def drop_pending_updates(token):
+    """Сообщаем Telegram, что мы готовы принимать обновления, и сбрасываем вебхук."""
+    url = f"https://api.telegram.org/bot{token}/deleteWebhook?drop_pending_updates=true"
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            print("✅ Вебхук сброшен, старые апдейты удалены")
+        else:
+            print(f"⚠️ Ошибка сброса вебхука: {response.text}")
+    except Exception as e:
+        print(f"⚠️ Не удалось сбросить вебхук: {e}")
+
+# --- Настройка логирования ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Этапы разговора
+# --- Константы ---
 NAME, GAME, TIME = range(3)
+WEBHOOK_URL = "https://hook.eu1.make.com/p6xhpykdytosqseygbrp3zw6c7bgvypp"   # твой вебхук Make.com
+ADMIN_CHAT_ID = 518113103                                                     # твой Telegram ID
 
-# Твой вебхук от Make.com
-WEBHOOK_URL = "https://hook.eu1.make.com/p6xhpykdytosqseygbrp3zw6c7bgvypp"
-
-# Твой Telegram ID для уведомлений и админки
-ADMIN_CHAT_ID = 518113103
-
-# Хранилище ID пользователей (в реальном проекте лучше использовать БД)
-# Но для простоты сохраняем в памяти и в файл
-import pickle
-
+# --- Работа с файлом пользователей ---
 USERS_FILE = "users.pkl"
 
 def load_users():
-    """Загружает список пользователей из файла"""
     if os.path.exists(USERS_FILE):
         with open(USERS_FILE, 'rb') as f:
             return pickle.load(f)
     return set()
 
 def save_user(user_id):
-    """Сохраняет нового пользователя"""
     users = load_users()
     users.add(user_id)
     with open(USERS_FILE, 'wb') as f:
         pickle.dump(users, f)
 
-# --- ОСНОВНЫЕ ФУНКЦИИ БОТА ---
-
+# --- ОСНОВНЫЕ ОБРАБОТЧИКИ ДИАЛОГА ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     save_user(user_id)
@@ -107,9 +106,11 @@ async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     game = context.user_data['game']
     time = context.user_data['time']
 
+    # Подтверждение пользователю
     result_message = f"✅ Ты записан!\n\nИмя: {player_name}\nИгра: {game}\nВремя: {time}\n\nЖдем тебя в Дискорде!"
     await query.edit_message_text(result_message)
 
+    # Уведомление админу
     admin_message = (
         f"📝 Новая запись!\n\n"
         f"Имя: {player_name}\n"
@@ -123,6 +124,7 @@ async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение админу: {e}")
 
+    # Отправка в Google Sheets через Make.com
     data = {
         "name": player_name,
         "game": game,
@@ -145,14 +147,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Просто нажми /start, чтобы записаться на игру.")
 
-# --- КОМАНДА РАССЫЛКИ (ТОЛЬКО ДЛЯ АДМИНА) ---
+# --- КОМАНДА ДЛЯ ПРОВЕРКИ (PING) ---
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ответит 'pong' — для проверки, что бот работает."""
+    await update.message.reply_text("pong 🏓")
 
+# --- КОМАНДА РАССЫЛКИ (ТОЛЬКО ДЛЯ АДМИНА) ---
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_CHAT_ID:
         await update.message.reply_text("⛔ У вас нет прав для этой команды.")
         return
-    
+
     message_text = ' '.join(context.args)
     if not message_text:
         await update.message.reply_text(
@@ -160,17 +166,16 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Например: /broadcast Напоминаю об игре сегодня в 20:00!"
         )
         return
-    
+
     users = load_users()
     if not users:
         await update.message.reply_text("📭 В базе пока нет пользователей для рассылки.")
         return
-    
+
     status_msg = await update.message.reply_text(f"📨 Начинаю рассылку {len(users)} пользователям...")
-    
+
     success = 0
     failed = 0
-    
     for uid in users:
         try:
             await context.bot.send_message(chat_id=uid, text=message_text)
@@ -178,27 +183,46 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Не удалось отправить сообщение пользователю {uid}: {e}")
             failed += 1
-    
+
     await status_msg.edit_text(
         f"✅ Рассылка завершена!\n\n"
         f"📊 Всего: {len(users)}\n"
         f"✅ Успешно: {success}\n"
         f"❌ Ошибок: {failed}"
     )
-    
+
     await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
         text=f"📊 Отчёт о рассылке:\nУспешно: {success}, Ошибок: {failed}"
     )
 
-# --- ЗАПУСК БОТА ---
+# --- ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ---
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    # Формируем текст ошибки для отправки админу
+    tb = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_string = ''.join(tb)
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"⚠️ Ошибка в боте:\n`{tb_string[:3000]}`",
+            parse_mode='Markdown'
+        )
+    except:
+        pass
 
+# --- ЗАПУСК БОТА ---
 def main() -> None:
-    # Проверяем, что бот запущен только один раз
-    lock_file = single_instance()  # <--- добавили защиту
-    
+    # Проверка единственного экземпляра
+    single_instance()
+
+    # Сброс вебхука перед запуском
+    drop_pending_updates(config.BOT_TOKEN)
+
+    # Создаём приложение
     application = Application.builder().token(config.BOT_TOKEN).build()
 
+    # Диалог записи
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -209,9 +233,14 @@ def main() -> None:
         fallbacks=[CommandHandler('cancel', cancel)],
     )
 
+    # Добавляем обработчики
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("ping", ping))
     application.add_handler(CommandHandler("broadcast", broadcast))
+
+    # Глобальный обработчик ошибок
+    application.add_error_handler(error_handler)
 
     print("Бот запущен...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
