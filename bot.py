@@ -4,7 +4,6 @@ import requests
 import os
 import pickle
 import traceback
-from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -42,12 +41,6 @@ def save_user(user_id):
     with open(USERS_FILE, "wb") as f:
         pickle.dump(users, f)
 
-# --- Flask для приёма вебхуков от Telegram ---
-flask_app = Flask(__name__)
-
-# --- Telegram Application (будет создан позже) ---
-application = None
-
 # --- Функция установки вебхука ---
 def set_webhook():
     hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
@@ -64,11 +57,6 @@ def set_webhook():
             logger.error(f"❌ Ошибка установки вебхука: {r.text}")
     except Exception as e:
         logger.error(f"❌ Ошибка при запросе к Telegram: {e}")
-
-# --- Маршрут для проверки здоровья (Render иногда проверяет) ---
-@flask_app.route("/health", methods=["GET"])
-def health():
-    return "OK", 200
 
 # --- ОСНОВНЫЕ ОБРАБОТЧИКИ ДИАЛОГА ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
