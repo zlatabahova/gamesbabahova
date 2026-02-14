@@ -5,7 +5,6 @@ import os
 import sys
 import pickle
 import traceback
-import time
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, filters, ContextTypes
@@ -37,12 +36,11 @@ def save_user(user_id):
 # --- Flask для приёма вебхуков от Telegram ---
 flask_app = Flask(__name__)
 
-# --- Telegram Application (будет инициализирован позже) ---
+# --- Telegram Application (будет инициализирован в run_bot) ---
 application = None
 
 # --- Функция установки вебхука ---
 def set_webhook():
-    # Render автоматически задаёт переменную окружения RENDER_EXTERNAL_HOSTNAME
     hostname = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
     if not hostname:
         logger.error("❌ RENDER_EXTERNAL_HOSTNAME не задан. Вебхук не установлен.")
@@ -67,7 +65,7 @@ def webhook():
     application.update_queue.put(update)
     return "OK", 200
 
-# --- Маршрут для проверки здоровья (Render иногда проверяет) ---
+# --- Маршрут для проверки здоровья ---
 @flask_app.route('/health', methods=['GET'])
 def health():
     return "OK", 200
@@ -117,7 +115,7 @@ async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     result_message = f"✅ Ты записан!\n\nИмя: {player_name}\nИгра: {game}\nВремя: {time}\n\nЖдем тебя в Дискорде!"
     await query.edit_message_text(result_message)
 
-    # Уведомление админу (вам) — теперь только сюда, без Make.com
+    # Уведомление админу (вам) — теперь только сюда
     admin_message = (
         f"📝 Новая запись!\n\n"
         f"Имя: {player_name}\n"
@@ -130,8 +128,6 @@ async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_message)
     except Exception as e:
         logger.error(f"Не удалось отправить сообщение админу: {e}")
-
-    # ВАЖНО: отправка в Make.com УДАЛЕНА
 
     return ConversationHandler.END
 
@@ -228,21 +224,14 @@ def run_bot():
     # Устанавливаем вебхук
     set_webhook()
 
-    # Запускаем обработку обновлений (вебхуки будут приходить на Flask)
-    # В этом режиме application.run_webhook() не используется, мы сами принимаем через Flask
-    # Но нужно запустить процесс обработки очереди. Для этого используем application.start()
+    # Запускаем обработку обновлений
     application.initialize()
     application.start()
     logger.info("✅ Бот запущен и готов принимать вебхуки")
 
-# --- Точка входа для Flask ---
-@flask_app.before_first_request
-def before_first_request():
-    # Инициализируем бота при первом запросе
-    run_bot()
-
-# --- Запуск Flask-сервера ---
+# --- Точка входа ---
 if __name__ == "__main__":
-    # Запускаем Flask (Render сам задаст порт через переменную окружения PORT)
+    # Инициализируем бота ДО запуска Flask
+    run_bot()
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
