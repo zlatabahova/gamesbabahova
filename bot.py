@@ -72,7 +72,7 @@ async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         logger.error(f"Не удалось отправить сообщение админу: {e}")
 
     # Здесь мы позже добавим отправку в Google Sheets через Make.com
-	webhook_url = "https://hook.eu1.make.com/p6xhpykdytosqseygbrp3zw6c7bgvypp"
+    webhook_url = "https://hook.eu1.make.com/p6xhpykdytosqseygbrp3zw6c7bgvypp"
     data = {
         "name": player_name,
         "game": game,
@@ -120,4 +120,5 @@ def main() -> None:
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
+
     main()
