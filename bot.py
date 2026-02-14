@@ -1,10 +1,36 @@
-# bot.py (дополненный код)
+# bot.py
 import logging
 import requests
-import json
+import os
+import sys
+import fcntl
+import atexit
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, filters, ContextTypes
 import config
+
+# --- Защита от запуска нескольких экземпляров ---
+LOCKFILE = "/tmp/bot_single_instance.lock"
+
+def single_instance():
+    """Пытаемся получить эксклюзивную блокировку файла.
+    Если не получается — значит другой экземпляр уже работает."""
+    try:
+        # Открываем файл для блокировки
+        lock_file = open(LOCKFILE, 'w')
+        # Пытаемся захватить блокировку (неблокирующий режим)
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Записываем PID процесса в файл
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        # При выходе из программы автоматически снимем блокировку
+        atexit.register(lambda: fcntl.flock(lock_file, fcntl.LOCK_UN))
+        return lock_file
+    except (IOError, OSError):
+        # Не удалось получить блокировку
+        print("❌ Ошибка: другой экземпляр бота уже запущен. Завершаем работу.")
+        sys.exit(1)
+# ------------------------------------------------
 
 # Включаем логирование
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -21,7 +47,6 @@ ADMIN_CHAT_ID = 518113103
 
 # Хранилище ID пользователей (в реальном проекте лучше использовать БД)
 # Но для простоты сохраняем в памяти и в файл
-import os
 import pickle
 
 USERS_FILE = "users.pkl"
@@ -40,14 +65,11 @@ def save_user(user_id):
     with open(USERS_FILE, 'wb') as f:
         pickle.dump(users, f)
 
-# --- ОСНОВНЫЕ ФУНКЦИИ БОТА (те, что уже были) ---
+# --- ОСНОВНЫЕ ФУНКЦИИ БОТА ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Запускает диалог, спрашивает имя."""
-    # Сохраняем пользователя при первом обращении
     user_id = update.effective_user.id
     save_user(user_id)
-    
     await update.message.reply_text("Привет! Давай запишем тебя на игру. Введи своё имя:")
     return NAME
 
@@ -123,18 +145,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Просто нажми /start, чтобы записаться на игру.")
 
-# --- НОВАЯ ФУНКЦИЯ: РАССЫЛКА ---
+# --- КОМАНДА РАССЫЛКИ (ТОЛЬКО ДЛЯ АДМИНА) ---
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет сообщение всем сохранённым пользователям (только для админа)"""
     user_id = update.effective_user.id
-    
-    # Проверяем, что команду использует админ
     if user_id != ADMIN_CHAT_ID:
         await update.message.reply_text("⛔ У вас нет прав для этой команды.")
         return
     
-    # Получаем текст сообщения для рассылки
     message_text = ' '.join(context.args)
     if not message_text:
         await update.message.reply_text(
@@ -143,16 +161,12 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Загружаем список пользователей
     users = load_users()
     if not users:
         await update.message.reply_text("📭 В базе пока нет пользователей для рассылки.")
         return
     
-    # Отправляем сообщение о начале рассылки
-    status_msg = await update.message.reply_text(
-        f"📨 Начинаю рассылку {len(users)} пользователям..."
-    )
+    status_msg = await update.message.reply_text(f"📨 Начинаю рассылку {len(users)} пользователям...")
     
     success = 0
     failed = 0
@@ -165,7 +179,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Не удалось отправить сообщение пользователю {uid}: {e}")
             failed += 1
     
-    # Отправляем отчёт
     await status_msg.edit_text(
         f"✅ Рассылка завершена!\n\n"
         f"📊 Всего: {len(users)}\n"
@@ -173,7 +186,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"❌ Ошибок: {failed}"
     )
     
-    # Дублируем отчёт админу в личку
     await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
         text=f"📊 Отчёт о рассылке:\nУспешно: {success}, Ошибок: {failed}"
@@ -182,6 +194,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- ЗАПУСК БОТА ---
 
 def main() -> None:
+    # Проверяем, что бот запущен только один раз
+    lock_file = single_instance()  # <--- добавили защиту
+    
     application = Application.builder().token(config.BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -196,7 +211,7 @@ def main() -> None:
 
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("broadcast", broadcast))  # Новая команда
+    application.add_handler(CommandHandler("broadcast", broadcast))
 
     print("Бот запущен...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
