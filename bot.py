@@ -2,8 +2,8 @@
 import logging
 import requests
 import os
-import pickle
 import traceback
+from supabase import create_client, Client
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -26,20 +26,35 @@ logger = logging.getLogger(__name__)
 NAME, GAME, TIME = range(3)
 ADMIN_CHAT_ID = 518113103  # ваш Telegram ID
 
-# --- Работа с файлом пользователей (для рассылки) ---
-USERS_FILE = "users.pkl"
+# --- Supabase клиент (данные берутся из переменных окружения) ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# --- Функции работы с пользователями в Supabase ---
 def load_users():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "rb") as f:
-            return pickle.load(f)
-    return set()
+    """Загружает список всех user_id из таблицы users"""
+    try:
+        response = supabase.table("users").select("user_id").execute()
+        return {row['user_id'] for row in response.data}
+    except Exception as e:
+        logger.error(f"Ошибка загрузки пользователей из Supabase: {e}")
+        return set()
 
-def save_user(user_id):
-    users = load_users()
-    users.add(user_id)
-    with open(USERS_FILE, "wb") as f:
-        pickle.dump(users, f)
+def save_user(user_id, username=None, first_name=None):
+    """Сохраняет нового пользователя, если его ещё нет в базе"""
+    try:
+        existing = supabase.table("users").select("user_id").eq("user_id", user_id).execute()
+        if not existing.data:
+            data = {"user_id": user_id}
+            if username:
+                data["username"] = username
+            if first_name:
+                data["first_name"] = first_name
+            supabase.table("users").insert(data).execute()
+            logger.info(f"✅ Новый пользователь сохранён: {user_id}")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения пользователя {user_id}: {e}")
 
 # --- Функция установки вебхука ---
 def set_webhook():
@@ -60,8 +75,8 @@ def set_webhook():
 
 # --- ОСНОВНЫЕ ОБРАБОТЧИКИ ДИАЛОГА ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    save_user(user_id)
+    user = update.effective_user
+    save_user(user.id, user.username, user.first_name)
     await update.message.reply_text("Привет! Давай запишем тебя на игру. Введи своё имя:")
     return NAME
 
@@ -109,7 +124,6 @@ async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     game = context.user_data["game"]
     time = context.user_data["time"]
 
-    # Подтверждение пользователю
     result_message = (
         f"✅ Ты записан!\n\n"
         f"Имя: {player_name}\n"
@@ -119,7 +133,6 @@ async def get_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     await query.edit_message_text(result_message)
 
-    # Уведомление админу (вам)
     admin_message = (
         f"📝 Новая запись!\n\n"
         f"Имя: {player_name}\n"
@@ -230,16 +243,9 @@ def create_application():
 
 # --- Точка входа ---
 if __name__ == "__main__":
-    # Создаём приложение
     app = create_application()
-
-    # Устанавливаем вебхук (синхронная операция)
     set_webhook()
-
-    # Получаем порт из окружения Render (по умолчанию 10000)
     port = int(os.environ.get("PORT", 10000))
-
-    # Запускаем вебхук. Этот метод сам вызывает initialize, start и запускает сервер.
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
