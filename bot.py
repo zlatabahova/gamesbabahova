@@ -29,14 +29,29 @@ ADMIN_CHAT_ID = 518113103  # ваш Telegram ID
 # --- Supabase клиент (данные берутся из переменных окружения) ---
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+logger.info(f"SUPABASE_URL: {SUPABASE_URL}")
+logger.info(f"SUPABASE_KEY (первые 20 символов): {SUPABASE_KEY[:20] if SUPABASE_KEY else 'None'}")
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# --- Проверка подключения к Supabase ---
+try:
+    test = supabase.table("users").select("user_id").limit(1).execute()
+    logger.info(f"✅ Подключение к Supabase успешно! Ответ: {test}")
+except Exception as e:
+    logger.error(f"❌ Ошибка подключения к Supabase: {e}")
+    if hasattr(e, 'response') and e.response:
+        logger.error(f"Детали ответа: {e.response.text[:500]}")
+    # Не завершаем работу, чтобы бот хотя бы частично функционировал, но запись не будет работать
 
 # --- Функции работы с пользователями в Supabase ---
 def load_users():
     """Загружает список всех user_id из таблицы users"""
     try:
         response = supabase.table("users").select("user_id").execute()
-        return {row['user_id'] for row in response.data}
+        users = {row['user_id'] for row in response.data}
+        logger.info(f"Загружено {len(users)} пользователей из Supabase")
+        return users
     except Exception as e:
         logger.error(f"Ошибка загрузки пользователей из Supabase: {e}")
         return set()
@@ -44,17 +59,32 @@ def load_users():
 def save_user(user_id, username=None, first_name=None):
     """Сохраняет нового пользователя, если его ещё нет в базе"""
     try:
+        logger.info(f"Пытаюсь сохранить пользователя {user_id} в Supabase...")
+        
+        # Проверяем, существует ли уже такой user_id
         existing = supabase.table("users").select("user_id").eq("user_id", user_id).execute()
+        logger.info(f"Результат проверки существования: {existing}")
+        
         if not existing.data:
             data = {"user_id": user_id}
             if username:
                 data["username"] = username
             if first_name:
                 data["first_name"] = first_name
-            supabase.table("users").insert(data).execute()
-            logger.info(f"✅ Новый пользователь сохранён: {user_id}")
+            logger.info(f"Вставляю данные: {data}")
+            
+            result = supabase.table("users").insert(data).execute()
+            logger.info(f"✅ Результат вставки: {result}")
+        else:
+            logger.info(f"ℹ️ Пользователь {user_id} уже существует в базе")
     except Exception as e:
-        logger.error(f"Ошибка сохранения пользователя {user_id}: {e}")
+        logger.error(f"❌ ОШИБКА сохранения пользователя {user_id}: {e}")
+        # Пытаемся получить детали ответа
+        if hasattr(e, 'response') and e.response:
+            try:
+                logger.error(f"Текст ответа: {e.response.text[:500]}")
+            except:
+                pass
 
 # --- Функция установки вебхука ---
 def set_webhook():
